@@ -1,0 +1,94 @@
+# Personal builds for this fork: an unsigned NOOPiOS .app under this fork's own bundle id prefix,
+# plus the `noop-local-access` MCP binary for an Apple Silicon Mac. Builds run here rather than
+# locally; `personal/bin/noop-install` downloads the iOS artifact, signs it with the owner's
+# development identity on the Mac, and installs it over the paired device.
+#
+# Requires the repository variable BUNDLE_ID_PREFIX (e.g. `com.example`); the app, widget and App
+# Group ids all derive from it (see Config/BundleId.xcconfig).
+name: Personal builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Strand/**'
+      - 'StrandiOS/**'
+      - 'StrandiOSShared/**'
+      - 'StrandiOSWidgets/**'
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
+      - 'Packages/**'
+      - 'Config/**'
+      - 'project.yml'
+      - '.github/workflows/personal-builds.yml'
+
+concurrency:
+  group: personal-builds-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    # iOS 26 Liquid Glass (glassEffect) needs the iOS 26 SDK → Xcode 26 → macos-26.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Write bundle id prefix
+        env:
+          PREFIX: ${{ vars.BUNDLE_ID_PREFIX }}
+        run: |
+          test -n "$PREFIX" || { echo "::error::set the BUNDLE_ID_PREFIX repository variable"; exit 1; }
+          printf 'BUNDLE_ID_PREFIX = %s\n' "$PREFIX" > Config/BundleIdSecrets.xcconfig
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build NOOPiOS for device (unsigned, Release)
+        # Release, as in fork-release.yml (#53): Debug artifacts make a re-signed install fail.
+        run: >-
+          xcodebuild -scheme NOOPiOS -configuration Release -destination 'generic/platform=iOS'
+          -derivedDataPath build/dd
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          COMPILER_INDEX_STORE_ENABLE=NO
+          build
+      - name: Package unsigned .ipa
+        # The watch app stays in the bundle; the install script strips it unless asked to keep it.
+        run: |
+          APP=$(find build/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
+          test -n "$APP" || { echo ".app (iphoneos) not found"; exit 1; }
+          test -d "$APP/PlugIns/NOOPWidgets.appex" || { echo "NOOPWidgets.appex missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist"
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry NOOP-unsigned.ipa Payload
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: noop-ios-unsigned
+          path: NOOP-unsigned.ipa
+          retention-days: 30
+
+  local-access:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Build noop-local-access (arm64, release)
+        working-directory: Packages/NoopLocalAccess
+        run: swift build -c release --arch arm64 --product noop-local-access
+      - name: Test NoopLocalAccess
+        working-directory: Packages/NoopLocalAccess
+        run: swift test
+      - name: Stage binary
+        run: |
+          mkdir -p out
+          cp Packages/NoopLocalAccess/.build/arm64-apple-macosx/release/noop-local-access out/
+          file out/noop-local-access
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: noop-local-access-macos-arm64
+          path: out/noop-local-access
+          retention-days: 30
