@@ -56,7 +56,9 @@ public enum NoopCLIQuery {
             case "--db-path":
                 configuration.databasePath = try requiredValue(flag, arguments: arguments, index: &index)
             case "--days":
-                guard toolName != "data_freshness" else { throw unsupported(flag, toolName: toolName) }
+                guard toolName != "data_freshness", toolName != "heart_rate_series" else {
+                    throw unsupported(flag, toolName: toolName)
+                }
                 toolArguments["days"] = try integerValue(flag, arguments: arguments, index: &index)
             case "--key":
                 guard toolName == "metric_series" else { throw unsupported(flag, toolName: toolName) }
@@ -73,6 +75,15 @@ public enum NoopCLIQuery {
             case "--limit":
                 guard toolName == "metric_series" else { throw unsupported(flag, toolName: toolName) }
                 toolArguments["limit"] = try integerValue(flag, arguments: arguments, index: &index)
+            case "--from", "--to":
+                guard toolName == "heart_rate_series" else { throw unsupported(flag, toolName: toolName) }
+                toolArguments[String(flag.dropFirst(2))] = .string(try requiredValue(flag, arguments: arguments, index: &index))
+            case "--hours":
+                guard toolName == "heart_rate_series" else { throw unsupported(flag, toolName: toolName) }
+                toolArguments["hours"] = try integerValue(flag, arguments: arguments, index: &index)
+            case "--bucket-minutes":
+                guard toolName == "heart_rate_series" else { throw unsupported(flag, toolName: toolName) }
+                toolArguments["bucket_minutes"] = try integerValue(flag, arguments: arguments, index: &index)
             default:
                 throw NoopCLIQueryError.usage("unknown query flag")
             }

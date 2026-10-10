@@ -115,6 +115,7 @@ enum NoopLocalAccessMain {
       data_freshness
       sleep_summary [--days N]
       workout_summary [--days N]
+      heart_rate_series [--from WHEN] [--to WHEN] [--hours N] [--bucket-minutes N]
 
     Query options:
       --db-path PATH    Explicit NOOP SQLite path. Otherwise NOOP_DB_PATH or the official app container is used.

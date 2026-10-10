@@ -1,0 +1,41 @@
+# Personal build of the `noop-local-access` MCP server for an Apple Silicon Mac, with its tests.
+# `personal/bin/noop-agent-setup` downloads the binary; agents launch it through personal/bin/noop-mcp.
+name: Personal MCP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Packages/NoopLocalAccess/**'
+      - '.github/workflows/personal-mcp.yml'
+
+concurrency:
+  group: personal-mcp-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  local-access:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Build noop-local-access (arm64, release)
+        working-directory: Packages/NoopLocalAccess
+        run: swift build -c release --arch arm64 --product noop-local-access
+      - name: Test NoopLocalAccess
+        working-directory: Packages/NoopLocalAccess
+        run: swift test
+      - name: Stage binary
+        run: |
+          mkdir -p out
+          cp Packages/NoopLocalAccess/.build/arm64-apple-macosx/release/noop-local-access out/
+          file out/noop-local-access
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: noop-local-access-macos-arm64
+          path: out/noop-local-access
+          retention-days: 30

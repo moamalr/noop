@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# The MCP server (stdio) that agents launch to read the WHOOP data NOOP collects on the iPhone.
+#
+# Serves the local snapshot read-only through noop-local-access. The snapshot is refreshed from the
+# phone when the server starts and then every $NOOP_REFRESH_MIN minutes (default 15) while an agent
+# is connected; noop-local-access reopens the replaced file on its next call. When the phone is out
+# of reach the last snapshot keeps being served, and the data_freshness tool says how old it is.
+#
+# stdout belongs to the MCP protocol: everything else goes to stderr or the log.
+set -uo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$BIN_DIR/_lib.sh"
+
+REFRESH_MIN="${NOOP_REFRESH_MIN:-15}"
+LOG="$AGENT_HOME/pull.log"
+mkdir -p "$AGENT_HOME"
+[ -x "$LOCAL_ACCESS_BIN" ] || die "noop-local-access is not installed; run personal/bin/noop-agent-setup"
+
+pull() { "$BIN_DIR/noop-pull" --if-older-than "$REFRESH_MIN" </dev/null >>"$LOG" 2>&1; }
+
+pull &
+if [ ! -f "$SNAPSHOT_DB" ]; then
+  # Nothing to serve yet: give the first pull a bounded head start before answering the client.
+  first=$!
+  for _ in $(seq 25); do kill -0 "$first" 2>/dev/null || break; sleep 1; done
+fi
+
+# Refresh while this server lives. After `exec` below, $$ is the server's pid, so the loop ends
+# within a minute of the agent disconnecting.
+SERVER_PID=$$
+(
+  minutes=0
+  while sleep 60 && kill -0 "$SERVER_PID" 2>/dev/null; do
+    minutes=$((minutes + 1))
+    [ $((minutes % REFRESH_MIN)) -eq 0 ] && pull
+  done
+) </dev/null >/dev/null 2>&1 &
+
+export NOOP_DB_PATH="$SNAPSHOT_DB"
+exec "$LOCAL_ACCESS_BIN" mcp

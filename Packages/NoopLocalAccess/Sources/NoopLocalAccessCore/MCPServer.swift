@@ -227,6 +227,17 @@ public func toolsList() -> JSONValue {
                     "days": integerProperty("Trailing days to include, default 90, max 4000."),
                 ]
             ),
+            tool(
+                name: "heart_rate_series",
+                title: "Heart Rate Series",
+                description: "Return intraday strap heart rate as min/avg/max buckets over a window of up to 7 days, with local timestamps. Use it for questions about a specific workout, night, or time of day.",
+                properties: [
+                    "from": stringProperty("Window start: YYYY-MM-DD or YYYY-MM-DDTHH:MM in local time, or ISO-8601 with an offset."),
+                    "to": stringProperty("Window end, same formats. Defaults to now, or to from + hours."),
+                    "hours": integerProperty("Window length when from or to is missing, default 24, max 168."),
+                    "bucket_minutes": integerProperty("Bucket width in minutes, default 5, max 60; widened automatically past 2000 buckets."),
+                ]
+            ),
         ]),
     ])
 }

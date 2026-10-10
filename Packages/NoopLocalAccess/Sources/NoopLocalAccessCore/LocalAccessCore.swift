@@ -169,6 +169,15 @@ public struct WorkoutRow: Equatable, Sendable {
     public let notes: String?
 }
 
+/// One aggregated slice of strap heart-rate samples; `startTs` is the bucket start in Unix seconds.
+public struct HeartRateBucketRow: Equatable, Sendable {
+    public let startTs: Int
+    public let minBpm: Int
+    public let avgBpm: Double
+    public let maxBpm: Int
+    public let samples: Int
+}
+
 public struct StorageStats: Equatable, Sendable {
     public let decodedRows: Int
     public let rawBatches: Int
@@ -290,6 +299,26 @@ public final class ReadonlyNoopStore {
                                maxHr: $0["maxHr"], strain: $0["strain"],
                                distanceM: $0["distanceM"], zonesJSON: $0["zonesJSON"],
                                notes: $0["notes"])
+                }
+        }
+    }
+
+    /// Strap heart-rate samples in `[from, to)`, aggregated into `bucketSeconds`-wide buckets aligned to
+    /// the Unix epoch. Zero readings (no skin contact) are left out.
+    public func heartRateBuckets(deviceId: String, from: Int, to: Int, bucketSeconds: Int) throws -> [HeartRateBucketRow] {
+        guard tableNames.contains("hrSample") else { return [] }
+        return try dbQueue.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT (ts / ?) * ? AS bucketTs, MIN(bpm) AS minBpm, AVG(bpm) AS avgBpm,
+                       MAX(bpm) AS maxBpm, COUNT(*) AS samples
+                FROM hrSample
+                WHERE deviceId = ? AND ts >= ? AND ts < ? AND bpm > 0
+                GROUP BY bucketTs
+                ORDER BY bucketTs ASC
+                """, arguments: [bucketSeconds, bucketSeconds, deviceId, from, to])
+                .map {
+                    HeartRateBucketRow(startTs: $0["bucketTs"], minBpm: $0["minBpm"], avgBpm: $0["avgBpm"],
+                                       maxBpm: $0["maxBpm"], samples: $0["samples"])
                 }
         }
     }
@@ -509,6 +538,45 @@ public final class NoopDataAccess {
             "averageDurationMin": optionalDouble(mean(durations)),
             "averageEfficiency": optionalDouble(mean(efficiencies)),
             "sessions": .array(merged.suffix(200).map(sleepJSON)),
+        ])
+    }
+
+    /// Intraday strap heart rate over `[from, to)`. The bucket widens past `bucketMinutes` when the window
+    /// would otherwise need more than `maxHeartRateBuckets` buckets; `bucketMinutes` in the payload is the
+    /// width actually used. Times are local ISO-8601 with offset, since questions about a workout or a
+    /// night are asked in wall-clock time.
+    public func heartRateSeries(from: Date, to: Date, bucketMinutes: Int) throws -> JSONValue {
+        let fromTs = Int(from.timeIntervalSince1970.rounded(.down))
+        let toTs = Int(to.timeIntervalSince1970.rounded(.up))
+        let neededMinutes = Int((Double(toTs - fromTs) / Double(maxHeartRateBuckets) / 60).rounded(.up))
+        let bucketSeconds = max(bucketMinutes, neededMinutes, 1) * 60
+        let rows = try store.heartRateBuckets(deviceId: deviceId, from: fromTs, to: toTs, bucketSeconds: bucketSeconds)
+        let samples = rows.reduce(0) { $0 + $1.samples }
+        let average = samples > 0
+            ? rows.reduce(0.0) { $0 + $1.avgBpm * Double($1.samples) } / Double(samples)
+            : nil
+
+        return .object([
+            "deviceId": .string(deviceId),
+            "timeZone": .string(TimeZone.current.identifier),
+            "range": .object(["from": .string(localISO(from)), "to": .string(localISO(to))]),
+            "bucketMinutes": .int(bucketSeconds / 60),
+            "summary": .object([
+                "samples": .int(samples),
+                "minBpm": optionalInt(rows.map(\.minBpm).min()),
+                "avgBpm": optionalDouble(average.map(roundedToTenth)),
+                "maxBpm": optionalInt(rows.map(\.maxBpm).max()),
+            ]),
+            "returned": .int(rows.count),
+            "buckets": .array(rows.map { row in
+                .object([
+                    "start": .string(localISO(Date(timeIntervalSince1970: TimeInterval(row.startTs)))),
+                    "minBpm": .int(row.minBpm),
+                    "avgBpm": .double(roundedToTenth(row.avgBpm)),
+                    "maxBpm": .int(row.maxBpm),
+                    "samples": .int(row.samples),
+                ])
+            }),
         ])
     }
 
@@ -770,4 +838,67 @@ private func logicalDayKey(_ now: Date) -> String {
 
 private func iso(_ date: Date) -> String {
     ISO8601DateFormatter().string(from: date)
+}
+
+private func localISO(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.timeZone = .current
+    return formatter.string(from: date)
+}
+
+private func roundedToTenth(_ value: Double) -> Double {
+    (value * 10).rounded() / 10
+}
+
+/// Longest window one `heart_rate_series` call reads: a week of per-second samples.
+let maxHeartRateWindowHours = 168
+
+/// Most buckets one `heart_rate_series` call returns before the bucket widens.
+let maxHeartRateBuckets = 2000
+
+/// Resolves the `heart_rate_series` window. With one end given, the other is `hours` away; with
+/// neither, the window ends at `now`.
+func heartRateWindow(
+    from: String?,
+    to: String?,
+    hours: Int,
+    now: Date = Date(),
+    timeZone: TimeZone = .current
+) throws -> (from: Date, to: Date) {
+    let span = TimeInterval(hours * 3_600)
+    let start = try from.map { try parseInstant($0, field: "from", timeZone: timeZone) }
+    let end = try to.map { try parseInstant($0, field: "to", timeZone: timeZone) }
+    let window: (from: Date, to: Date)
+    switch (start, end) {
+    case let (start?, end?): window = (start, end)
+    case let (start?, nil): window = (start, start.addingTimeInterval(span))
+    case let (nil, end?): window = (end.addingTimeInterval(-span), end)
+    case (nil, nil): window = (now.addingTimeInterval(-span), now)
+    }
+    guard window.from < window.to else {
+        throw LocalAccessError.invalidParams("heart_rate_series requires from to be earlier than to")
+    }
+    guard window.to.timeIntervalSince(window.from) <= TimeInterval(maxHeartRateWindowHours * 3_600) else {
+        throw LocalAccessError.invalidParams("heart_rate_series covers at most \(maxHeartRateWindowHours) hours per call")
+    }
+    return window
+}
+
+/// Parses ISO-8601 with an offset, or `YYYY-MM-DD[THH:MM[:SS]]` read as wall-clock time in `timeZone`.
+func parseInstant(_ raw: String, field: String, timeZone: TimeZone = .current) throws -> Date {
+    let internet = ISO8601DateFormatter()
+    for options: ISO8601DateFormatter.Options in [[.withInternetDateTime], [.withInternetDateTime, .withFractionalSeconds]] {
+        internet.formatOptions = options
+        if let date = internet.date(from: raw) { return date }
+    }
+    let local = DateFormatter()
+    local.locale = Locale(identifier: "en_US_POSIX")
+    local.timeZone = timeZone
+    for format in ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+        local.dateFormat = format
+        if let date = local.date(from: raw) { return date }
+    }
+    throw LocalAccessError.invalidParams(
+        "\(field) must be YYYY-MM-DD, YYYY-MM-DDTHH:MM (local time) or ISO-8601 with an offset"
+    )
 }

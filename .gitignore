@@ -118,3 +118,6 @@ tools/linux-capture/*.db
 tools/linux-capture/*.db-wal
 tools/linux-capture/*.db-shm
 tools/linux-capture/captures/
+
+# Personal fork: local overrides for personal/bin scripts
+personal/config.local.env

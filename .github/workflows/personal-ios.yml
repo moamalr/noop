@@ -1,11 +1,10 @@
-# Personal builds for this fork: an unsigned NOOPiOS .app under this fork's own bundle id prefix,
-# plus the `noop-local-access` MCP binary for an Apple Silicon Mac. Builds run here rather than
-# locally; `personal/bin/noop-install` downloads the iOS artifact, signs it with the owner's
-# development identity on the Mac, and installs it over the paired device.
+# Personal iOS build for this fork: an unsigned NOOPiOS .app under this fork's own bundle id
+# prefix. The compile runs here rather than on the Mac; `personal/bin/noop-install` downloads the
+# artifact, signs it with the owner's development identity and installs it on the paired iPhone.
 #
 # Requires the repository variable BUNDLE_ID_PREFIX (e.g. `com.example`); the app, widget and App
 # Group ids all derive from it (see Config/BundleId.xcconfig).
-name: Personal builds
+name: Personal iOS
 
 on:
   workflow_dispatch:
@@ -19,12 +18,12 @@ on:
       - 'NOOPWatch/**'
       - 'NOOPWatchComplications/**'
       - 'Packages/**'
+      - '!Packages/NoopLocalAccess/**'
       - 'Config/**'
       - 'project.yml'
-      - '.github/workflows/personal-builds.yml'
 
 concurrency:
-  group: personal-builds-${{ github.ref }}
+  group: personal-ios-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -69,26 +68,4 @@ jobs:
         with:
           name: noop-ios-unsigned
           path: NOOP-unsigned.ipa
-          retention-days: 30
-
-  local-access:
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: Build noop-local-access (arm64, release)
-        working-directory: Packages/NoopLocalAccess
-        run: swift build -c release --arch arm64 --product noop-local-access
-      - name: Test NoopLocalAccess
-        working-directory: Packages/NoopLocalAccess
-        run: swift test
-      - name: Stage binary
-        run: |
-          mkdir -p out
-          cp Packages/NoopLocalAccess/.build/arm64-apple-macosx/release/noop-local-access out/
-          file out/noop-local-access
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: noop-local-access-macos-arm64
-          path: out/noop-local-access
           retention-days: 30

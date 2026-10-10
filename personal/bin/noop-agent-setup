@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# One-time agent setup: install the noop-local-access binary built by CI, take a first snapshot
+# from the phone, and register the `whoop` MCP server (personal/bin/noop-mcp) with the agent CLIs
+# found on this Mac: Claude Code (user scope), Codex and OpenCode.
+#
+# Usage: noop-agent-setup [--run RUN_ID] [--no-register]
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$BIN_DIR/_lib.sh"
+
+RUN_ID="" REGISTER=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) RUN_ID="$2"; shift 2 ;;
+    --no-register) REGISTER=0; shift ;;
+    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+if [ -z "$RUN_ID" ]; then
+  RUN_ID="$(gh run list -R "$NOOP_REPO" --workflow personal-mcp.yml --branch main --status success \
+    --limit 1 --json databaseId --jq '.[0].databaseId')"
+  [ -n "$RUN_ID" ] || die "no successful Personal MCP run on $NOOP_REPO yet"
+fi
+WORK="$(mktemp -d -t noop-agent-setup)"
+trap 'rm -rf "$WORK"' EXIT
+log "downloading noop-local-access from run $RUN_ID"
+gh run download "$RUN_ID" -R "$NOOP_REPO" -n noop-local-access-macos-arm64 -D "$WORK" >&2
+mkdir -p "$(dirname "$LOCAL_ACCESS_BIN")"
+install -m 755 "$WORK/noop-local-access" "$LOCAL_ACCESS_BIN"
+
+"$BIN_DIR/noop-pull" || log "first snapshot failed; noop-mcp retries whenever an agent connects"
+if [ -f "$SNAPSHOT_DB" ]; then
+  NOOP_DB_PATH="$SNAPSHOT_DB" "$LOCAL_ACCESS_BIN" query data_freshness >/dev/null \
+    && log "noop-local-access reads the snapshot"
+fi
+
+[ "$REGISTER" = 1 ] || exit 0
+MCP="$BIN_DIR/noop-mcp"
+
+if command -v claude >/dev/null; then
+  claude mcp remove whoop -s user >/dev/null 2>&1 || true
+  claude mcp add -s user whoop -- "$MCP" >&2 && log "registered with Claude Code (user scope)"
+fi
+
+if command -v codex >/dev/null; then
+  codex mcp remove whoop >/dev/null 2>&1 || true
+  codex mcp add whoop -- "$MCP" >&2 && log "registered with Codex"
+fi
+
+OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
+if [ -f "$OPENCODE_CONFIG" ]; then
+  cp "$OPENCODE_CONFIG" "$OPENCODE_CONFIG.backup-whoop-$(date +%Y%m%d-%H%M%S)"
+  python3 -I - "$OPENCODE_CONFIG" "$MCP" <<'PY'
+import json, sys
+path, command = sys.argv[1:3]
+config = json.load(open(path))
+config.setdefault("mcp", {})["whoop"] = {"type": "local", "command": [command], "enabled": True}
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PY
+  log "registered with OpenCode ($OPENCODE_CONFIG, backup alongside)"
+fi

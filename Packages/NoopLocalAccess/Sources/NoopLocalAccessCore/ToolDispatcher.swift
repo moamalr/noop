@@ -4,6 +4,11 @@ import Foundation
 public final class NoopToolDispatcher {
     private let configuration: LocalAccessConfiguration
     private var dataAccess: NoopDataAccess?
+    /// Inode of the file `dataAccess` was opened from. A snapshot that is replaced on disk (a new file
+    /// renamed over the old path, as a phone pull does) gets a new inode, so the next call reopens it
+    /// rather than serving the replaced file for the rest of a long-lived MCP session. A live store
+    /// written in place keeps its inode, and its open read connection already sees new commits.
+    private var openedInode: UInt64?
 
     public init(configuration: LocalAccessConfiguration = .environment()) {
         self.configuration = configuration
@@ -15,6 +20,7 @@ public final class NoopToolDispatcher {
         "data_freshness",
         "sleep_summary",
         "workout_summary",
+        "heart_rate_series",
     ]
 
     public func dispatch(name: String, arguments: [String: JSONValue] = [:]) throws -> JSONValue {
@@ -39,6 +45,17 @@ public final class NoopToolDispatcher {
             return try data().sleepSummary(days: boundedDays(arguments["days"], default: 30, max: 4000))
         case "workout_summary":
             return try data().workoutSummary(days: boundedDays(arguments["days"], default: 90, max: 4000))
+        case "heart_rate_series":
+            let window = try heartRateWindow(
+                from: arguments["from"]?.stringValue,
+                to: arguments["to"]?.stringValue,
+                hours: boundedLimit(arguments["hours"], default: 24, max: maxHeartRateWindowHours)
+            )
+            return try data().heartRateSeries(
+                from: window.from,
+                to: window.to,
+                bucketMinutes: boundedLimit(arguments["bucket_minutes"], default: 5, max: 60)
+            )
         default:
             throw LocalAccessError.toolNotFound(name)
         }
@@ -60,15 +77,24 @@ public final class NoopToolDispatcher {
     }
 
     private func data() throws -> NoopDataAccess {
-        if let dataAccess { return dataAccess }
+        let inode = currentInode()
+        if let dataAccess, inode == openedInode { return dataAccess }
         do {
             let access = try NoopDataAccess.open(configuration: configuration)
             dataAccess = access
+            openedInode = inode
             return access
         } catch let error as LocalAccessError {
             throw error
         } catch {
             throw LocalAccessError.databaseUnavailable("NOOP database is not available: \(error)")
         }
+    }
+
+    private func currentInode() -> UInt64? {
+        guard let path = try? DatabasePathResolver.resolve(configuration: configuration),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        else { return nil }
+        return (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
     }
 }

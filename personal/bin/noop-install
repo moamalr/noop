@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Install this fork's NOOP on the paired iPhone.
+#
+# Downloads the unsigned NOOPiOS build from the newest successful "Personal iOS" run (or takes
+# a local .ipa), signs it with this Mac's Apple Development identity and the matching development
+# profiles, and installs it with devicectl. The compile happens in CI, so the Mac needs only a few
+# hundred MB of scratch space.
+#
+# Usage: noop-install [--run RUN_ID | --ipa PATH] [--no-install]
+#
+# The development profiles for $APP_BUNDLE_ID and $WIDGET_BUNDLE_ID (HealthKit + the App Group) must
+# already be in ~/Library/Developer/Xcode/UserData/Provisioning Profiles; personal/bin/noop-provision
+# creates them.
+set -euo pipefail
+. "$(dirname "$0")/_lib.sh"
+
+RUN_ID="" IPA="" INSTALL=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) RUN_ID="$2"; shift 2 ;;
+    --ipa) IPA="$2"; shift 2 ;;
+    --no-install) INSTALL=0; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+read -r DEVICE_ID DEVICE_UDID < <(resolve_device) || die "no target iPhone"
+log "device: $DEVICE_ID ($DEVICE_UDID)"
+
+WORK="$(mktemp -d -t noop-install)"
+trap 'rm -rf "$WORK"' EXIT
+
+if [ -z "$IPA" ]; then
+  if [ -z "$RUN_ID" ]; then
+    RUN_ID="$(gh run list -R "$NOOP_REPO" --workflow personal-ios.yml --branch main --status success \
+      --limit 1 --json databaseId --jq '.[0].databaseId')"
+    [ -n "$RUN_ID" ] || die "no successful Personal iOS run on $NOOP_REPO yet"
+  fi
+  log "downloading build from run $RUN_ID"
+  gh run download "$RUN_ID" -R "$NOOP_REPO" -n noop-ios-unsigned -D "$WORK" >&2
+  IPA="$WORK/NOOP-unsigned.ipa"
+fi
+unzip -q "$IPA" -d "$WORK/x"
+APP="$(find "$WORK/x/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
+[ -n "$APP" ] || die "no .app inside $IPA"
+
+BUILT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+[ "$BUILT_ID" = "$APP_BUNDLE_ID" ] || die "build is $BUILT_ID, expected $APP_BUNDLE_ID (check the BUNDLE_ID_PREFIX repo variable)"
+WIDGET="$APP/PlugIns/NOOPWidgets.appex"
+[ -d "$WIDGET" ] || die "NOOPWidgets.appex missing from the build"
+for ext in "$APP"/PlugIns/*.appex; do
+  [ "$ext" = "$WIDGET" ] || die "unexpected extension $(basename "$ext"); teach noop-install to sign it"
+done
+# The watch app needs its own watchOS profiles; leave it out until those exist.
+rm -rf "$APP/Watch"
+
+# Pick each profile, the identity it trusts, and write the entitlements to sign with.
+python3 -I - "$WORK" "$DEVICE_UDID" "$APP_BUNDLE_ID" "$WIDGET_BUNDLE_ID" "$APP_GROUP_ID" \
+  "$REPO_DIR/StrandiOS/Resources/NOOP.entitlements" "$REPO_DIR/StrandiOSWidgets/NOOPWidgets.entitlements" <<'PY'
+import datetime, glob, hashlib, os, plistlib, subprocess, sys
+work, udid, app_id, widget_id, group, app_ents, widget_ents = sys.argv[1:8]
+now = datetime.datetime.now(datetime.timezone.utc)
+dirs = [os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles"),
+        os.path.expanduser("~/Library/MobileDevice/Provisioning Profiles")]
+profiles = []
+for path in sum((glob.glob(os.path.join(d, "*.mobileprovision")) for d in dirs), []):
+    raw = subprocess.run(["security", "cms", "-D", "-i", path], capture_output=True).stdout
+    if raw:
+        p = plistlib.loads(raw); p["_path"] = path; profiles.append(p)
+
+identities = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                            capture_output=True, text=True).stdout
+identity_hashes = {line.split()[1] for line in identities.splitlines() if '"' in line}
+
+def pick(bundle_id):
+    ok = []
+    for p in profiles:
+        team = p["TeamIdentifier"][0]
+        exp = p["ExpirationDate"].replace(tzinfo=datetime.timezone.utc)
+        if p["Entitlements"].get("application-identifier") != f"{team}.{bundle_id}" or exp <= now:
+            continue
+        if udid not in p.get("ProvisionedDevices", []) and not p.get("ProvisionsAllDevices"):
+            continue
+        certs = {hashlib.sha1(c).hexdigest().upper() for c in p["DeveloperCertificates"]}
+        if certs & identity_hashes:
+            ok.append((p["CreationDate"], p, sorted(certs & identity_hashes)[0]))
+    if not ok:
+        sys.exit(f"no valid development profile for {bundle_id} that includes device {udid} "
+                 "and a signing identity in this keychain (run personal/bin/noop-provision)")
+    ok.sort(key=lambda t: t[0])
+    return ok[-1][1], ok[-1][2]
+
+def entitlements(src, profile, bundle_id):
+    text = open(src).read().replace("$(APP_GROUP_ID)", group)
+    want = plistlib.loads(text.encode())
+    allowed = profile["Entitlements"]
+    team = profile["TeamIdentifier"][0]
+    for key, value in want.items():
+        if key not in allowed:
+            sys.exit(f"profile {profile['Name']!r} does not allow {key} for {bundle_id}")
+        if key == "com.apple.security.application-groups" and not set(value) <= set(allowed[key]):
+            sys.exit(f"profile {profile['Name']!r} does not include App Group {value}")
+    want.update({
+        "application-identifier": f"{team}.{bundle_id}",
+        "com.apple.developer.team-identifier": team,
+        "get-task-allow": allowed.get("get-task-allow", False),
+        "keychain-access-groups": [f"{team}.{bundle_id}"],
+    })
+    return want
+
+out = {}
+for name, bundle_id, src in (("app", app_id, app_ents), ("widget", widget_id, widget_ents)):
+    profile, identity = pick(bundle_id)
+    with open(os.path.join(work, f"{name}.entitlements"), "wb") as f:
+        plistlib.dump(entitlements(src, profile, bundle_id), f)
+    out[name] = (profile["_path"], identity, profile["Name"])
+if out["app"][1] != out["widget"][1]:
+    sys.exit("app and widget profiles trust different identities")
+with open(os.path.join(work, "signing.env"), "w") as f:
+    f.write(f'APP_PROFILE="{out["app"][0]}"\nWIDGET_PROFILE="{out["widget"][0]}"\nIDENTITY="{out["app"][1]}"\n')
+print(f"profiles: {out['app'][2]} / {out['widget'][2]}", file=sys.stderr)
+PY
+# shellcheck disable=SC1091
+. "$WORK/signing.env"
+
+sign() { codesign --force --sign "$IDENTITY" --timestamp=none --generate-entitlement-der "$@" >&2; }
+
+# Inside out: nested frameworks and dylibs, then the extension, then the app.
+while IFS= read -r -d '' nested; do
+  sign "$nested"
+done < <(find "$APP" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0)
+cp "$WIDGET_PROFILE" "$WIDGET/embedded.mobileprovision"
+sign --entitlements "$WORK/widget.entitlements" "$WIDGET"
+cp "$APP_PROFILE" "$APP/embedded.mobileprovision"
+sign --entitlements "$WORK/app.entitlements" "$APP"
+codesign --verify --deep --strict "$APP"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist"))"
+log "signed NOOP $VERSION as $APP_BUNDLE_ID"
+
+if [ "$INSTALL" = 1 ]; then
+  xcrun devicectl device install app --device "$DEVICE_ID" "$APP" >&2
+  log "installed NOOP $VERSION on $DEVICE_ID"
+fi

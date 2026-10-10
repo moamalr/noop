@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Copy NOOP's SQLite store off the paired iPhone into a read-only snapshot on this Mac.
+#
+# Works over USB or the local network, because the app is development-signed (get-task-allow), which
+# lets devicectl read its data container. The store and its -wal/-shm sidecars are copied together,
+# folded into one file, integrity-checked, and only then renamed over the previous snapshot, so a
+# reader never sees a half-written file.
+#
+# Usage: noop-pull [--if-older-than MINUTES] [--quiet]
+set -euo pipefail
+. "$(dirname "$0")/_lib.sh"
+
+MAX_AGE_MIN=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --if-older-than) MAX_AGE_MIN="$2"; shift 2 ;;
+    --quiet) log() { :; }; shift ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+mkdir -p "$AGENT_HOME"
+if [ -n "$MAX_AGE_MIN" ] && [ -f "$SNAPSHOT_DB" ] && [ -z "$(find "$SNAPSHOT_DB" -mmin +"$MAX_AGE_MIN")" ]; then
+  log "snapshot is under $MAX_AGE_MIN min old; skipping"
+  exit 0
+fi
+
+# One pull at a time across agent sessions; a lock older than five minutes is from a dead pull.
+LOCK="$AGENT_HOME/.pull.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +5)" ]; then
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || { log "another pull is running"; exit 0; }
+  else
+    log "another pull is running"
+    exit 0
+  fi
+fi
+WORK="$(mktemp -d "$AGENT_HOME/.pull.XXXXXX")"
+trap 'rm -rf "$WORK" "$LOCK"' EXIT
+
+read -r DEVICE_ID _ < <(resolve_device) || die "no target iPhone"
+
+copy() {
+  xcrun devicectl device copy from --device "$DEVICE_ID" \
+    --domain-type appDataContainer --domain-identifier "$APP_BUNDLE_ID" \
+    --source "$DEVICE_DB_PATH$1" --destination "$WORK/whoop.sqlite$1" >/dev/null 2>&1
+}
+
+attempt=1
+while :; do
+  rm -f "$WORK"/whoop.sqlite*
+  copy "" || die "could not read $DEVICE_DB_PATH from $APP_BUNDLE_ID on $DEVICE_ID (is NOOP installed and opened once?)"
+  # The sidecars only exist while the app has the store open.
+  copy "-wal" || true
+  copy "-shm" || true
+  # Checkpointing folds the WAL into the main file so the snapshot is one self-contained database.
+  if sqlite3 "$WORK/whoop.sqlite" 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;' >/dev/null 2>&1 \
+     && [ "$(sqlite3 "$WORK/whoop.sqlite" 'PRAGMA quick_check;' 2>/dev/null)" = "ok" ]; then
+    break
+  fi
+  # A copy taken mid-write can tear; another try usually lands between writes.
+  [ "$attempt" -lt 3 ] || die "snapshot failed its integrity check after $attempt attempts"
+  attempt=$((attempt + 1))
+  log "snapshot torn by a concurrent write, retrying ($attempt/3)"
+  sleep 2
+done
+
+rm -f "$WORK/whoop.sqlite-wal" "$WORK/whoop.sqlite-shm"
+touch "$WORK/whoop.sqlite"
+mv -f "$WORK/whoop.sqlite" "$SNAPSHOT_DB"
+log "snapshot: $SNAPSHOT_DB ($(du -h "$SNAPSHOT_DB" | cut -f1))"
